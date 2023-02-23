@@ -15,10 +15,12 @@ from rosbags.rosbag2 import Reader
 from rosbags.serde import deserialize_cdr
 import open3d as o3d
 # ----------------------------------------------------------------------------------------------------------------------
+import RANSAC_cuboid
 import tools_DF
 import tools_IO
 import tools_wavefront
 from CV import tools_pr_geom
+import tools_render_CV
 import tools_draw_numpy
 import tools_image
 import tools_time_convertor
@@ -70,11 +72,11 @@ class LParser(object):
             i = self.float_from_bytes(msg.data[msg.point_step * r +12:msg.point_step * r + 16])
             frame.append([x, y, z, i])
 
-        th_intensity = 28
+        #th_intensity = 28
 
         frame = numpy.array(frame)
         frame = frame[~numpy.all(frame == 0, axis=1)]
-        frame = frame[frame[:,3]>th_intensity]
+        #frame = frame[frame[:,3]>th_intensity]
         df_frame = pd.DataFrame(frame)
 
         return df_frame
@@ -90,7 +92,13 @@ class LParser(object):
         return df_lidar
 # ----------------------------------------------------------------------------------------------------------------------
     def import_lidar_df_fast(self,folder_in,lidar_frame_id):
-        df_lidar = pd.read_csv(folder_in+'%06d.csv'%lidar_frame_id)
+        pcd_raw = o3d.t.io.read_point_cloud(folder_in+'%06d.pcd'%lidar_frame_id)
+        xyz = pcd_raw.point['positions'].to(o3d.core.float32)
+        df_lidar = pd.DataFrame(xyz.numpy())
+        pcd = o3d.t.geometry.PointCloud(xyz)
+        if 'intensity' in pcd_raw.point:
+            pcd.point['intensity'] = pcd_raw.point['intensity'].to(o3d.core.float32)
+
         return df_lidar
 # ----------------------------------------------------------------------------------------------------------------------
     def get_video_frame_pos_mapping(self,filename_in_video):
@@ -151,7 +159,7 @@ class LParser(object):
             dd['Y'] = dd['Y'].interpolate()
             dd['ts_sec'] = S1.min()+dd['Y'].astype('int')
             dd['msec'] = [('%.7f'%(f%1))[2:] for f in dd['Y']]
-            df = dd[['frame_id','ts_sec','msec']]
+            df = dd[['frame_id','ts_sec','msec']].copy()
 
         df['frame_id'] = df['frame_id'].astype('int')
         df['ts_sec']= df['ts_sec'].astype('int')
@@ -218,7 +226,10 @@ class LParser(object):
             i=0
             for connection, timestamp, rawdata in reader.messages(connections=connections):
                 df_frame = self.import_lidar_rawdata(rawdata, connection)
-                df_frame.to_csv(self.folder_out+'/lidar/%06d.csv'%i,index=False)
+                pcd = o3d.t.geometry.PointCloud()
+                pcd.point["positions"] = o3d.core.Tensor(df_frame.values[:,:3])
+                pcd.point["intensity"] = o3d.core.Tensor(df_frame.values[:,3].reshape((-1,1)))
+                o3d.t.io.write_point_cloud(self.folder_out+'/lidar/%06d.pcd'%i, pcd)
                 print(i)
                 i+=1
         return
@@ -248,12 +259,15 @@ class LParser(object):
 
         tools_IO.remove_files(self.folder_out, '*.obj,*.mtl')
         #self.pointcloud_df_to_obj(df_lidar,'lidar.obj',max_V=9000,noise=0.05,auto_triangulate=False,color=(200,200,200))
-        self.pointcloud_df_to_obj_v2_clusters(df_lidar)
+        df_clusters = self.pointcloud_df_to_obj_v2(df_lidar)
 
         self.R.my_VBO.remove_total()
         self.R.init_object(self.folder_out)
         self.R.bind_VBO()
         image = self.R.get_image()
+
+        line_3d = self.detect_closest_line(df_clusters)
+        image = tools_render_CV.draw_lines_numpy_MVP(line_3d, image, self.R.mat_projection,self.R.mat_view, self.R.mat_model, self.R.mat_trns,color=(0,0,255), w=2)
 
         return image
 # ----------------------------------------------------------------------------------------------------------------------
@@ -325,7 +339,7 @@ class LParser(object):
             #colors[labels < 0] = 0
             #pcd.colors = o3d.utility.Vector3dVector(colors[:, :3])
             #o3d.visualization.draw_geometries([pcd])
-        return numpy.array(labels)
+        return numpy.array([int(l) for l in labels])
 # ----------------------------------------------------------------------------------------------------------------------
     def strighten_plane(self,df,eq=None):
 
@@ -335,49 +349,54 @@ class LParser(object):
             df = df.iloc[best_inliers]
 
         df_res = self.plane_to_polygon(df,eq)
+        df_res.columns = df.columns[:3]
         return df_res
 # ----------------------------------------------------------------------------------------------------------------------
-    def get_ortho_planes(self, df,do_streight=True,remove_ground=True,augment_bottom=True):
+    def get_ortho_planes(self, df,cluster_id=None,do_streight=True,remove_ground=True):
 
         cuboid = pyrsc.Cuboid()
         best_eqs,best_inliers = cuboid.fit(df.iloc[:, :3].values, thresh=0.05, maxIteration=5000)
         df_best=df.iloc[best_inliers].copy()
         df_best['I'] = 1
-        loss = abs(numpy.array([best_eqs[0].reshape((-1,4)).dot(df_best.T.values),
+
+        loss = abs(numpy.array([best_eqs[0].reshape((-1,4)).dot(df_best.iloc[:,:4].T.values),
                                 best_eqs[1].reshape((-1,4)).dot(df_best.T.values),
                                 best_eqs[2].reshape((-1,4)).dot(df_best.T.values)])).reshape((3, -1)).T
 
+
+
         i = numpy.argmin(loss,axis=1)
-        df_xx = df.iloc[[i for i in range(df.shape[0]) if i not in best_inliers]]
+        df_xx = df.iloc[[i for i in range(df.shape[0]) if i not in best_inliers]].copy()
+
         df_p0 = df_best.iloc[i==0,:3]
         df_p1 = df_best.iloc[i==1,:3]
         df_p2 = df_best.iloc[i==2,:3]
+
 
         if do_streight:
             df_p0 = self.strighten_plane(df_p0, best_eqs[0])
             df_p1 = self.strighten_plane(df_p1, best_eqs[1])
             df_p2 = self.strighten_plane(df_p2, best_eqs[2])
 
-        df_res_list = [df_p0,df_p1,df_p2]
+        df_xx['cluster_id'] = -1
+        df_p0['cluster_id'] = cluster_id
+        df_p1['cluster_id'] = cluster_id
+        df_p2['cluster_id'] = cluster_id
 
+        df_p0['face_id'] = 0
+        df_p1['face_id'] = 1
+        df_p2['face_id'] = 2
+
+        df_res_list = [df_p0, df_p1, df_p2]
         if remove_ground:
             loss = numpy.array([min(numpy.linalg.norm(best_eqs[i,:3]-(0,0,1)),numpy.linalg.norm(best_eqs[i,:3]-(0,0,-1))) for i in range(3)])
+
             df_res_list = [df for i,df in enumerate(df_res_list) if i!=numpy.argmin(loss)]
 
-            if augment_bottom:
-                df_best = pd.concat([df_res_list[0], df_res_list[1]], axis=0)
-                best_eqs, best_inliers = cuboid.fit(df_best.iloc[:, :3].values)
-                df_best['I'] = 1
-                loss = abs(numpy.array([best_eqs[0].reshape((-1, 4)).dot(df_best.T.values),
-                                        best_eqs[1].reshape((-1, 4)).dot(df_best.T.values),
-                                        best_eqs[2].reshape((-1, 4)).dot(df_best.T.values)])).reshape((3, -1)).T
-                df_best.drop(columns=['I'], inplace=True)
-                df_res_list=df_res_list+[df_best[loss[:,2]<0.2]]
 
+        df_ortho_planes = pd.concat([df_xx]+df_res_list,axis=0,ignore_index=True)
 
-
-
-        return [df_xx]+df_res_list
+        return df_ortho_planes
 
 # ----------------------------------------------------------------------------------------------------------------------
     def plane_to_polygon(self, df,eq):
@@ -404,30 +423,105 @@ class LParser(object):
 
         return df_res
 # ----------------------------------------------------------------------------------------------------------------------
-    def pointcloud_df_to_obj_v2_clusters(self,df):
+    def planes_to_lines(self, list_of_df_planes):
+
+        lines = []
+        for i in range(0, len(list_of_df_planes) - 1):
+            if list_of_df_planes[i].shape[0]<5:
+                continue
+            plane1 = pyrsc.Plane()
+            eq1, best_inliers = plane1.fit(list_of_df_planes[i].values)
+            for j in range(i+1, len(list_of_df_planes)):
+                if list_of_df_planes[j].shape[0] < 5:
+                    continue
+                plane2 = pyrsc.Plane()
+                eq2, best_inliers = plane2.fit(list_of_df_planes[j].values)
+                point, direction = tools_render_CV.plane_plane_intersection(eq1, eq2)
+                lines.append(numpy.concatenate([point,point+1000*direction]))
+
+        return pd.DataFrame(lines)
+# ----------------------------------------------------------------------------------------------------------------------
+    def pointcloud_df_to_clusters(self, df,do_streight=False,remove_ground=False):
 
         labels = self.get_clusters(df,eps=0.5, min_points=100)
+        df_res = pd.DataFrame([])
 
-        df_cluster0=pd.DataFrame([])
-        colors = tools_draw_numpy.get_colors(numpy.max(labels)+1,colormap = 'jet')
         for l in numpy.unique(labels):
             df_cluster = df.iloc[labels == l, :3]
+            if l==-1:
+                df_res = df_cluster.copy()
+                df_res['cluster_id']=-1
+                pass
+            else:
+                df_planes = self.get_ortho_planes(df_cluster,cluster_id=l,do_streight=do_streight,remove_ground=remove_ground).copy()
+
+                df_res = pd.concat([df_res, df_planes], ignore_index=True)
+
+        return df_res
+# ----------------------------------------------------------------------------------------------------------------------
+    def detect_closest_line(self,df_clusters):
+
+        labels = numpy.array([int(v) for v in df_clusters['cluster_id'].unique()])
+        df_lines = pd.DataFrame([])
+
+        for l in numpy.unique(labels):
+            if l==-1:
+                continue
+
+            df_cluster = df_clusters[df_clusters['cluster_id']==l]
+            faces = [f for f in df_cluster['face_id'].unique() if f>=0]
+            list_of_df_planes = [df_cluster[df_cluster['face_id']==f].iloc[:,:3] for f in faces]
+            df_lines = pd.concat([df_lines,self.planes_to_lines(list_of_df_planes)])
+
+        d = numpy.linalg.norm(numpy.array([tools_render_CV.line_plane_intersection((0, 0, 1), (0, 0, 0),
+                                                 (df_lines.iloc[r, 3:].values - df_lines.iloc[r, :3].values),
+                                                 df_lines.iloc[r, :3].values) for r in range(df_lines.shape[0])]))
+
+        closest_line = df_lines.iloc[numpy.argmin(d), :].values.reshape((1, -1))
+
+        return closest_line
+# ----------------------------------------------------------------------------------------------------------------------
+    def detect_closest_points(self, df_clusters):
+
+        labels = numpy.array([int(v) for v in df_clusters['cluster_id'].unique()])
+        df_lines = pd.DataFrame([])
+
+        for l in numpy.unique(labels):
+            if l == -1:
+                continue
+
+            df_cluster = df_clusters[df_clusters['cluster_id'] == l]
+            faces = [f for f in df_cluster['face_id'].unique() if f >= 0]
+            list_of_df_planes = [df_cluster[df_cluster['face_id'] == f].iloc[:, :3] for f in faces]
+
+
+
+
+        closest_line = df_lines.iloc[numpy.argmin(d), :].values.reshape((1, -1))
+
+        return closest_line
+
+# ----------------------------------------------------------------------------------------------------------------------
+    def pointcloud_df_to_obj_v2(self, df):
+
+        tools_IO.remove_files(self.folder_out, '*.obj,*.mtl')
+        df_clusters = self.pointcloud_df_to_clusters(df,do_streight=True,remove_ground=True)
+
+        labels = numpy.array([int(v) for v in df_clusters['cluster_id'].unique()])
+        colors = tools_draw_numpy.get_colors(numpy.max(labels)+1,colormap = 'jet')
+        for l in numpy.unique(labels):
+            df_cluster = tools_DF.apply_filter(df_clusters,'cluster_id',l)
 
             if l==-1:
-                df_cluster0 = df_cluster.copy()
+                max_V, noise, auto_triangulate, color = 8000, 0.05, False, (192, 192, 192)
+                #self.pointcloud_df_to_obj(df_cluster.iloc[:, :3], 'cluster_none.obj', max_V=max_V, noise=noise,auto_triangulate=auto_triangulate, color=color)
             else:
                 max_V,noise,auto_triangulate,color = None,0,True,colors[l]
+                for face in df_cluster['face_id'].unique():
+                    filename_out = 'cluster_%02d_face%d.obj' % (l,face)
+                    self.pointcloud_df_to_obj(df_cluster[df_cluster['face_id']==face].iloc[:,:3], filename_out, image=None, max_V=max_V, noise=noise,auto_triangulate=auto_triangulate, color=color)
 
-                df_plenes = self.get_ortho_planes(df_cluster,do_streight=True,remove_ground=True)
-                df_cluster0 = pd.concat([df_cluster0,df_plenes[0]],axis=1,ignore_index=True)
-                for p,df_plane in enumerate(df_plenes[1:]):
-                    filename_out = 'cluster_%02d%c.obj' % (l, chr(ord('A')+p))
-                    self.pointcloud_df_to_obj(df_plane, filename_out, image=None, max_V=max_V, noise=noise,auto_triangulate=auto_triangulate, color=color)
-
-        max_V,noise,auto_triangulate,color = 8000,0.05,False,(192,192,192)
-        self.pointcloud_df_to_obj(df_cluster0, 'cluster_none.obj', image=None, max_V=max_V, noise=noise,auto_triangulate=auto_triangulate, color=color)
-
-        return
+        return df_clusters
 
 # ----------------------------------------------------------------------------------------------------------------------
     def get_camera_frame(self,filename_in_video,frame_ID):
@@ -458,9 +552,9 @@ class LParser(object):
     def video_BEV(self,folder_in_lidar_raw,folder_in_lidar_import,filename_in_video,filename_timestamps_video,start_time_sec=None,stop_time_sec=None):
 
         #df_lidar_timestamps = self.get_lidar_timestamps(folder_in_lidar_raw)
-        df_lidar_timestamps = pd.read_csv(self.folder_out+'df_lidar_timestamps_wide.csv')
+        df_lidar_timestamps = pd.read_csv(self.folder_out+'df_lidar_timestamps.csv')
 
-        df_camera_timestamps = self.get_camera_timestamps(filename_timestamps_video)
+        df_camera_timestamps = self.get_camera_timestamps(filename_timestamps_video,interpolate=True)
         df_camera_timestamps = self.fetch_lidar_frames(df_lidar_timestamps,df_camera_timestamps)
         df_camera_timestamps.to_csv(self.folder_out + 'df_camera_timestamps.csv', index=False)
 
