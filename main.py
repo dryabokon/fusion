@@ -75,7 +75,7 @@ def batch_rename_lidar_files():
 # ----------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
 
-    #P.video_BEV(folder_in_lidar_raw,folder_in_lidar_import,filename_in_video_normal,filename_timestamps_video_normal,start_time_sec = 6*60+22)
+    P.video_BEV(folder_in_lidar_raw,folder_in_lidar_import,filename_in_video_normal,filename_timestamps_video_normal,start_time_sec = 6*60+22)
     #P.video_BEV(folder_in_lidar_raw,folder_in_lidar_import, filename_in_video_wide  ,filename_timestamps_video_wide  ,start_time_sec = 6*60+30)
 
     #P.pointcloud_df_to_obj_v2(P.import_lidar_df_fast(folder_in_lidar_import, lidar_frame_id= 7156))
@@ -84,4 +84,3 @@ if __name__ == '__main__':
 
     #ex_convert_lidar_camera_data(folder_in_lidar_raw)
     #ex_render()
-    batch_rename_lidar_files()

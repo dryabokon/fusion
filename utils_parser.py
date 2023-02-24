@@ -15,7 +15,6 @@ from rosbags.rosbag2 import Reader
 from rosbags.serde import deserialize_cdr
 import open3d as o3d
 # ----------------------------------------------------------------------------------------------------------------------
-import RANSAC_cuboid
 import tools_DF
 import tools_IO
 import tools_wavefront
@@ -25,11 +24,14 @@ import tools_draw_numpy
 import tools_image
 import tools_time_convertor
 import tools_GL3D
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 class LParser(object):
     def __init__(self,folder_out=None):
         self.folder_out = folder_out
         self.R = self.init_render()
+
         return
 # ----------------------------------------------------------------------------------------------------------------------
     def init_render(self):
@@ -135,7 +137,7 @@ class LParser(object):
 
         return df
 # ----------------------------------------------------------------------------------------------------------------------
-    def get_camera_timestamps(self, filename_timestamps_video, interpolate=False):
+    def get_camera_timestamps(self, filename_timestamps_video, do_debug=False):
         lines = tools_IO.get_lines(filename_timestamps_video)
         frame_ID, ts_sec, msec = [], [], []
         for i,line in enumerate(lines):
@@ -149,30 +151,27 @@ class LParser(object):
             msec.append(ts[10:])
         df = pd.DataFrame({'frame_id': frame_ID, 'ts_sec': ts_sec,'msec':msec})
 
-        if interpolate:
-            S1 = df['ts_sec'].astype(int)
-            Y = 1.0*(S1.values - S1.min())
-            Y= Y+numpy.array([int(s[:3]) / 1000 for s in df['msec'].astype('str').values])
-            d0 = pd.DataFrame({'frame_id': df['frame_id'].values, 'Y': Y})
-            dd = pd.DataFrame({'frame_id':numpy.arange(frame_ID[0],frame_ID[-1])})
-            dd = tools_DF.fetch(dd,'frame_id',d0,'frame_id','Y')
-            dd['Y'] = dd['Y'].interpolate()
-            dd['ts_sec'] = S1.min()+dd['Y'].astype('int')
-            dd['msec'] = [('%.7f'%(f%1))[2:] for f in dd['Y']]
-            df = dd[['frame_id','ts_sec','msec']].copy()
-
         df['frame_id'] = df['frame_id'].astype('int')
         df['ts_sec']= df['ts_sec'].astype('int')
         df['msec'] = df['msec'].astype('str')
-
-
         delta1 = df['ts_sec'].values - df['ts_sec'].values[0]
         delta2 = numpy.array([int(str(s)[:3]) / 1000 for s in df['msec'].values]) - int( str(df['msec'].values[0])[:3]) / 1000
         delta = delta1 + delta2
         df['time_delta'] = tools_time_convertor.pretify_timedelta(delta)
+
+        if do_debug:
+            image = numpy.full((1080, 1920, 3), 255, dtype=numpy.uint8)
+            points = numpy.concatenate([numpy.arange(0,delta.shape[0]).reshape((-1,1)),delta.reshape((-1,1))],axis=1)
+            points[:, 0] /= numpy.max(points[:, 0]) / image.shape[1]
+            points[:, 1] /= numpy.max(points[:, 1]) / image.shape[0]
+            points[:, 1] = image.shape[0] - points[:, 1]
+
+            image = tools_draw_numpy.draw_points(image, points, color=(0, 0, 200), w=1, transperency=0.95)
+            cv2.imwrite(self.folder_out + 'camera_timestamps.png', image)
+
         return df
 # ----------------------------------------------------------------------------------------------------------------------
-    def get_lidar_timestamps(self, folder_in_lidar):
+    def get_lidar_timestamps(self, folder_in_lidar,do_debug=False):
 
         with Reader(folder_in_lidar) as reader:
             connections = [x for x in reader.connections if x.topic == '/livox/lidar']
@@ -182,10 +181,25 @@ class LParser(object):
             ts_sec = [str(ts)[:10] for ts in timestamps]
             msec   = [str(ts)[10:] for ts in timestamps]
 
-            df_lidar_timestamps = pd.DataFrame({'lidar_frame_id':numpy.arange(0,len(timestamps)),'ts_sec':ts_sec,'msec':msec})
-            df_lidar_timestamps.to_csv(self.folder_out+'df_lidar_timestamps.csv',index=False)
+            df = pd.DataFrame({'lidar_frame_id':numpy.arange(0,len(timestamps)),'ts_sec':ts_sec,'msec':msec})
+            df.to_csv(self.folder_out+'df_lidar_timestamps.csv',index=False)
 
-        return df_lidar_timestamps
+            if do_debug:
+                mina = int(ts_sec[0])
+                delta = numpy.array([int(a)-mina + int(b[:3])/1000 for a,b in zip(ts_sec, msec)])
+
+                image = numpy.full((1080, 1920, 3), 255, dtype=numpy.uint8)
+                points = numpy.concatenate([numpy.arange(0, delta.shape[0]).reshape((-1, 1)), delta.reshape((-1, 1))],
+                                           axis=1)
+                points[:, 0] /= numpy.max(points[:, 0]) / image.shape[1]
+                points[:, 1] /= numpy.max(points[:, 1]) / image.shape[0]
+                points[:, 1] = image.shape[0] - points[:, 1]
+
+                image = tools_draw_numpy.draw_points(image, points, color=(0, 0, 200), w=1, transperency=0.95)
+                cv2.imwrite(self.folder_out + 'lidar_timestamps.png', image)
+
+
+        return df
 
 # ----------------------------------------------------------------------------------------------------------------------
     def get_lidar_frame_id(self, df_lidar_timestamps, ts_sec, msec):
@@ -551,10 +565,10 @@ class LParser(object):
 # ----------------------------------------------------------------------------------------------------------------------
     def video_BEV(self,folder_in_lidar_raw,folder_in_lidar_import,filename_in_video,filename_timestamps_video,start_time_sec=None,stop_time_sec=None):
 
-        #df_lidar_timestamps = self.get_lidar_timestamps(folder_in_lidar_raw)
-        df_lidar_timestamps = pd.read_csv(self.folder_out+'df_lidar_timestamps.csv')
+        df_lidar_timestamps = self.get_lidar_timestamps(folder_in_lidar_raw)
+        #df_lidar_timestamps = pd.read_csv(self.folder_out+'df_lidar_timestamps.csv')
 
-        df_camera_timestamps = self.get_camera_timestamps(filename_timestamps_video,interpolate=True)
+        df_camera_timestamps = self.get_camera_timestamps(filename_timestamps_video)
         df_camera_timestamps = self.fetch_lidar_frames(df_lidar_timestamps,df_camera_timestamps)
         df_camera_timestamps.to_csv(self.folder_out + 'df_camera_timestamps.csv', index=False)
 
