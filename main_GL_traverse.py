@@ -129,6 +129,7 @@ cam_fov_deg = 90
 # ----------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
 
+    #tg_half_fovx = numpy.tan(cam_fov_deg * numpy.pi / 360)
 
     R = tools_GL3D.render_GL3D(filename_obj=filename_obj, W=W, H=H, do_normalize_model_file=do_normalize_model_file,textured=textured,projection_type='P',
                                cam_fov_deg=cam_fov_deg,scale=(1, 1, 1),eye = eye,target=target,up=up,

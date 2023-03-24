@@ -272,16 +272,13 @@ class LParser(object):
     def pointcloud_df_to_render_image(self, df_lidar):
 
         tools_IO.remove_files(self.folder_out, '*.obj,*.mtl')
-        #self.pointcloud_df_to_obj(df_lidar,'lidar.obj',max_V=9000,noise=0.05,auto_triangulate=False,color=(200,200,200))
-        df_clusters = self.pointcloud_df_to_obj_v2(df_lidar)
+        self.pointcloud_df_to_obj(df_lidar,'lidar.obj',max_V=9000,noise=0.05,auto_triangulate=False,color=(200,200,200))
+        #df_clusters = self.pointcloud_df_to_obj_v2(df_lidar)
 
         self.R.my_VBO.remove_total()
         self.R.init_object(self.folder_out)
         self.R.bind_VBO()
         image = self.R.get_image()
-
-        line_3d = self.detect_closest_line(df_clusters)
-        image = tools_render_CV.draw_lines_numpy_MVP(line_3d, image, self.R.mat_projection,self.R.mat_view, self.R.mat_model, self.R.mat_trns,color=(0,0,255), w=2)
 
         return image
 # ----------------------------------------------------------------------------------------------------------------------
@@ -300,7 +297,7 @@ class LParser(object):
         df_noise = df_noise.sort_values(by='i')
         return df_noise
 # ----------------------------------------------------------------------------------------------------------------------
-    def pointcloud_df_to_obj(self, df, filename_out, image=None, max_V=None, noise=0.05, auto_triangulate=False, color=(128, 128, 128)):
+    def pointcloud_df_to_obj(self, df, filename_out, image=None, max_V=8000, noise=0.05, auto_triangulate=False, color=(128, 128, 128)):
 
         if max_V is not None and df.shape[0]>max_V:
             df = df.iloc[numpy.random.choice(df.shape[0], max_V, replace=False)].copy()
@@ -473,6 +470,45 @@ class LParser(object):
 
         return df_res
 # ----------------------------------------------------------------------------------------------------------------------
+    def fit_dominant_plane(self,points,confidence = 0.85,inlier_threshold = 0.02,min_sample_distance = 0.8):
+        #https://github.com/salykovaa/ransac/blob/main/fit_plane.py
+        #https://medium.com/@ajithraj_gangadharan/3d-ransac-algorithm-for-lidar-pcd-segmentation-315d2a51351
+
+        N = len(points)
+        m = 3
+        eta_0 = 1 - confidence
+        k, eps, error_star = 0, m / N, numpy.inf
+        I = 0
+        best_inliers = numpy.full(shape=(N,), fill_value=0.)
+        best_plane = numpy.full(shape=(4,), fill_value=-1.)
+        while pow((1 - pow(eps, m)), k) >= eta_0:
+            p1, p2, p3 = points[numpy.random.randint(N)], points[numpy.random.randint(N)], points[numpy.random.randint(N)]
+            if numpy.linalg.norm(p1 - p2) < min_sample_distance or numpy.linalg.norm(
+                    p2 - p3) < min_sample_distance or numpy.linalg.norm(p1 - p3) < min_sample_distance:
+                continue
+            n = numpy.cross(p2 - p1, p3 - p1)
+            n = n / numpy.linalg.norm(n)  ### normalization
+            if n[2] < 0:  ### positive z direction
+                n = -n
+            d = -numpy.dot(n, p1)  ### parameter d
+            distances = numpy.abs(numpy.dot(points, n) + d)
+
+            inliers = distances < inlier_threshold
+            error = numpy.sum(~inliers)
+
+            if error < error_star:
+                I = numpy.sum(inliers)
+                eps = I / N
+                best_inliers = inliers
+                error_star = error
+            k = k + 1
+        A = points[best_inliers]
+        y = numpy.full(shape=(len(A),), fill_value=1.)
+        best_plane[0:3] = numpy.linalg.lstsq(A, y, rcond=-1)[0]
+        if best_plane[2] < 0:  ### positive z direction
+            best_plane = -best_plane
+        return best_plane, best_inliers
+# ----------------------------------------------------------------------------------------------------------------------
     def detect_closest_line(self,df_clusters):
 
         labels = numpy.array([int(v) for v in df_clusters['cluster_id'].unique()])
@@ -519,7 +555,8 @@ class LParser(object):
     def pointcloud_df_to_obj_v2(self, df):
 
         tools_IO.remove_files(self.folder_out, '*.obj,*.mtl')
-        df_clusters = self.pointcloud_df_to_clusters(df,do_streight=True,remove_ground=True)
+        #df_clusters = self.pointcloud_df_to_clusters(df,do_streight=True,remove_ground=True)
+        df_clusters = self.pointcloud_df_to_clusters(df,do_streight=False,remove_ground=False)
 
         labels = numpy.array([int(v) for v in df_clusters['cluster_id'].unique()])
         colors = tools_draw_numpy.get_colors(numpy.max(labels)+1,colormap = 'jet')
@@ -528,7 +565,7 @@ class LParser(object):
 
             if l==-1:
                 max_V, noise, auto_triangulate, color = 8000, 0.05, False, (192, 192, 192)
-                #self.pointcloud_df_to_obj(df_cluster.iloc[:, :3], 'cluster_none.obj', max_V=max_V, noise=noise,auto_triangulate=auto_triangulate, color=color)
+                self.pointcloud_df_to_obj(df_cluster.iloc[:, :3], 'cluster_none.obj', max_V=max_V, noise=noise,auto_triangulate=auto_triangulate, color=color)
             else:
                 max_V,noise,auto_triangulate,color = None,0,True,colors[l]
                 for face in df_cluster['face_id'].unique():
